@@ -1,11 +1,12 @@
 package portforwarder;
 
 import java.io.IOException;
-import java.net.SocketAddress;
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
+import java.util.Map;
 
 class Connection {
 
@@ -25,35 +26,74 @@ class Connection {
     private ByteBuffer cfBuffer = ByteBuffer.allocate(BUFFER_SIZE);
     private int fcReadBytes = 0;
     private int cfReadBytes = 0;
+    private Map<SelectionKey, Connection> connectionServerMap;
+    private int listenPort;
 
-    Connection(Selector selector, SocketChannel clientChannel) {
+    Connection(Selector selector,
+               SocketChannel clientChannel,
+               Map<SelectionKey, Connection> connectionServerMap, // bad architecture, I know :(
+               int listenPort
+    ) {
         this.clientChannel = clientChannel;
         this.selector = selector;
+        this.connectionServerMap = connectionServerMap;
+        this.listenPort = listenPort;
     }
 
-    void connectToServer(SocketAddress serverSocketAddress) throws IOException {
+    private void connectToServer(InetSocketAddress serverSocketAddress) throws IOException {
         SocketChannel serverChannel = SocketChannel.open();
         serverChannel.configureBlocking(false);
         serverChannel.connect(serverSocketAddress);
-        serverChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_CONNECT);
+        SelectionKey key = serverChannel.register(selector,
+                SelectionKey.OP_READ | SelectionKey.OP_CONNECT | SelectionKey.OP_WRITE);
+        connectionServerMap.put(key, this);
+        this.serverChannel = serverChannel;
     }
 
     int readFromServer() {
+        if (clientChannel.isConnected() && status == Status.CONNECTED) {
+            if (fcReadBytes != 0) {
+                return 0;
+            }
+            try {
+                fcReadBytes = serverChannel.read(fcBuffer);
+            } catch (IOException ex) {
+                return -1;
+            }
+//            System.out.println("Read from server: " + fcReadBytes);
+//            System.out.println(new String(fcBuffer.array()));
+            if (fcReadBytes == -1) {
+                return -1;
+            }
+        }
         return 0;
     }
 
-    int writeToClient() throws IOException {
+    int writeToClient() {
         if (clientChannel.isConnected()) {
             if (fcReadBytes == 0) {
                 return 0;
             }
-            int written = clientChannel.write(ByteBuffer.wrap(fcBuffer.array(), 0, fcReadBytes));
-            System.out.println("Written: " + String.valueOf(written));
-            System.out.println(new String(fcBuffer.array()));
+            if (fcReadBytes < 0) {
+                return -1;
+            }
+            try {
+                int written = clientChannel.write(ByteBuffer.wrap(fcBuffer.array(), 0, fcReadBytes));
+            } catch (IOException ex) {
+                return -1;
+            }
+//            System.out.println("Written to client: " + String.valueOf(written));
+//            System.out.println("From connection: " + this);
+//            System.out.println(new String(fcBuffer.array()));
+//            System.out.println();
             if (status == Status.NO_CONNECTION) {
                 status = Status.AUTHENTICATED;
                 cfReadBytes = 0;
                 cfBuffer.clear();
+            } else if (status == Status.AUTHENTICATED) {
+                status = Status.CONNECTED;
+                cfBuffer.clear();
+                cfReadBytes = 0;
             }
             fcReadBytes = 0;
             fcBuffer.clear();
@@ -63,6 +103,28 @@ class Connection {
     }
 
     int writeToServer() {
+        if (serverChannel.isConnected() && status == Status.CONNECTED) {
+            if (cfReadBytes == 0) {
+                return 0;
+            }
+            if (cfReadBytes < 0) {
+                return -1;
+            }
+//            System.out.println("Going to write to server: " + cfReadBytes);
+//            System.out.println(new String(cfBuffer.array()));
+            int written;
+            try {
+                written = serverChannel.write(ByteBuffer.wrap(cfBuffer.array(), 0, cfReadBytes));
+            } catch (IOException ex) {
+                return -1;
+            }
+            if (written == -1) {
+                return -1;
+            }
+
+            cfReadBytes = 0;
+            cfBuffer.clear();
+        }
         return 0;
     }
 
@@ -76,32 +138,38 @@ class Connection {
             } else if (status == Status.AUTHENTICATED) {
                 return readAndConnect();
             } else if (status == Status.CONNECTED) {
-                //return readAllFromClient();
+                try {
+                    cfReadBytes = clientChannel.read(cfBuffer);
+                } catch (IOException ex) {
+                    return -1;
+                }
+                if (cfReadBytes == -1) {
+                    return -1;
+                }
+//                System.out.println("Read from client: " + cfReadBytes);
+//                System.out.println("From connection: " + this);
+//                System.out.println(new String(cfBuffer.array()));
+//                System.out.println();
             }
             return 0;
         }
         return -1;
     }
 
-//    private int readAllFromClient() throws IOException {
-//            cfReadBytes = clientChannel.read(cfBuffer);
-//            if (cfReadBytes > 0) {
-//                int written = clientChannel.write(ByteBuffer.wrap(buffer.array(), 0, bytesRead));
-//                System.out.println("Written: " + String.valueOf(written));
-//                for (int i = 0; i < bytesRead; ++i) {
-//                    System.out.println((int) buffer.array()[i]);
-//                }
-//                System.out.println();
-//            }
-//            if (bytesRead == -1) {
-//                serverChannel.close();
-//                fcBuffer.clear();
-//                return -1;
-//            } else {
-//                return 0;
-//            }
-//    }
 
+    void sendConnectionConfirmation() {
+        byte[] arr = {
+                0x05, // version
+                0x00, // status "connection established"
+                0x00, // reserved byte
+                0x01, // type of address
+                0x7F, 0x00, 0x00, 0x01, // 127.0.0.1 (not sure what does it do)
+                (byte)((listenPort >> 8) & 0xFF), (byte)(listenPort & 0xFF)  // port (not sure about this one as well)
+        };
+        fcBuffer.clear();
+        fcBuffer.put(arr);
+        fcReadBytes = 10;
+    }
 
     private int readAndConnect() throws IOException {
         cfReadBytes = clientChannel.read(cfBuffer);
@@ -109,6 +177,25 @@ class Connection {
             if (!validateSecondRequest(cfBuffer)) {
                 return -1;
             }
+            byte[] array = cfBuffer.array();
+            if (array[3] == 0x01) {
+                StringBuilder sb = new StringBuilder();
+                sb.append(unsignedByteToSignedInt(array[4]));
+                sb.append(".");
+                sb.append(unsignedByteToSignedInt(array[5]));
+                sb.append(".");
+                sb.append(unsignedByteToSignedInt(array[6]));
+                sb.append(".");
+                sb.append(unsignedByteToSignedInt(array[7]));
+                int port = ((array[8] & 0xff) << 8) | (array[9] & 0xff); // make one int of two bytes
+                InetSocketAddress address = new InetSocketAddress(sb.toString(), port);
+                connectToServer(address);
+            } else if (array[3] == 0x03){    // TODO: add support of dns resolving
+                System.out.println("DNS FOUND!!!");
+                return -1;
+            }
+
+
         }
         return 0;
     }
@@ -152,7 +239,6 @@ class Connection {
     }
 
     private boolean validateSecondRequest(ByteBuffer buffer) {
-
         if (buffer.array()[0] != 0x05) {
             System.out.println("This version of SOCKS is not supported: " + cfBuffer.array()[0]);
             return false;
@@ -165,6 +251,15 @@ class Connection {
             System.out.println("Wrong format request, third byte expected to be 0x00");
             return false;
         }
+        if (buffer.array()[3] != 0x01 && buffer.array()[3] != 0x03) {
+            System.out.println("Such type of host address is not supported");
+            return false;
+        }
         return true;
+    }
+
+    // need this because byte is always signed in Java, but we need to convert in to unsigned int (e.g. -128 -> 255)
+    private static int unsignedByteToSignedInt(byte b) {
+        return (int) b & 0xFF;
     }
 }

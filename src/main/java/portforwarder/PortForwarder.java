@@ -9,20 +9,15 @@ import java.util.HashMap;
 import java.util.Map;
 
 public class PortForwarder {
-    private ArrayList<SessionStorage> sessionStorages = new ArrayList<>();
-   // private ArrayList<Connection> connections = new ArrayList<>();
     private Map<SelectionKey, Connection> connectionClientMap = new HashMap<>();
     private Map<SelectionKey, Connection> connectionServerMap = new HashMap<>();
-    private InetSocketAddress serverAddress;
     private ServerSocketChannel serverChannel;
     private Selector selector;
+    private int l_port;
 
     public PortForwarder(String args[]) throws IOException {
 
-        int l_port = Integer.valueOf(args[0]);
-        InetAddress r_host = InetAddress.getByName(args[1]);
-        int r_port = Integer.valueOf(args[2]);
-        serverAddress = new InetSocketAddress(r_host, r_port);
+        l_port = Integer.valueOf(args[0]);
 
         selector = Selector.open();
         serverChannel = ServerSocketChannel.open();
@@ -57,7 +52,7 @@ public class PortForwarder {
             clientChannel.configureBlocking(false);
             SelectionKey key = clientChannel.register(selector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
 
-            connectionClientMap.put(key, new Connection(selector, clientChannel));
+            connectionClientMap.put(key, new Connection(selector, clientChannel, connectionServerMap, l_port));
             //connections.add(new Connection(selector, clientChannel));
             //sessionStorages.add(new SessionStorage(serverChannel, clientChannel, bufferSize));
             //sessionStorages.add(new SessionStorage(clientChannel, serverChannel, bufferSize));
@@ -66,6 +61,7 @@ public class PortForwarder {
 
     private void connect(SelectionKey key) throws IOException {
         ((SocketChannel) key.channel()).finishConnect();
+        connectionServerMap.get(key).sendConnectionConfirmation();
     }
 
     private void read(SelectionKey key) throws IOException {
@@ -95,6 +91,7 @@ public class PortForwarder {
         if (ret != 0) {
             connectionServerMap.remove(key);
             connectionClientMap.remove(key);
+            key.cancel();
         }
     }
 }

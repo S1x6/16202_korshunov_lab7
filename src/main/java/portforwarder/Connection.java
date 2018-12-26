@@ -168,13 +168,13 @@ class Connection {
     }
 
 
-    void sendConnectionConfirmation() {
+    void sendConnectionStatus(byte status) {
         if (serverChannel.isConnected()) {
             return;
         }
         byte[] arr = {
                 0x05, // version
-                0x00, // status "connection established"
+                status, // status "connection established"
                 0x00, // reserved byte
                 0x01, // type of address
                 0x7F, 0x00, 0x00, 0x01, // 127.0.0.1 (not sure what does it do)

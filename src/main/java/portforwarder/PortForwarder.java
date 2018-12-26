@@ -97,8 +97,13 @@ public class PortForwarder {
     }
 
     private void connect(SelectionKey key) throws IOException {
-        ((SocketChannel) key.channel()).finishConnect();
-        connectionServerMap.get(key).sendConnectionConfirmation();
+        try {
+            ((SocketChannel) key.channel()).finishConnect();
+        } catch (ConnectException ex) {
+            connectionServerMap.get(key).sendConnectionStatus((byte)0x05);
+            return;
+        }
+        connectionServerMap.get(key).sendConnectionStatus((byte)0x00);
     }
 
     private void read(SelectionKey key) throws IOException {

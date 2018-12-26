@@ -1,8 +1,12 @@
 package portforwarder;
 
+import org.xbill.DNS.*;
+
 import java.io.IOException;
+import java.net.DatagramPacket;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
@@ -20,24 +24,31 @@ class Connection {
 
     private Selector selector;
     private SocketChannel clientChannel;
+    private Map<SelectionKey, Connection> connectionServerMap;
+    private int listenPort;
+    private DatagramChannel dnsChannel;
+    private Map<String, Connection> dnsMap;
+
     private SocketChannel serverChannel;
-    private Status status = Status.NO_CONNECTION;
     private ByteBuffer fcBuffer = ByteBuffer.allocate(BUFFER_SIZE);
     private ByteBuffer cfBuffer = ByteBuffer.allocate(BUFFER_SIZE);
     private int fcReadBytes = 0;
     private int cfReadBytes = 0;
-    private Map<SelectionKey, Connection> connectionServerMap;
-    private int listenPort;
+    private Status status = Status.NO_CONNECTION;
+    private int serverPort;
 
     Connection(Selector selector,
                SocketChannel clientChannel,
                Map<SelectionKey, Connection> connectionServerMap, // bad architecture, I know :(
-               int listenPort
-    ) {
+               int listenPort,
+               DatagramChannel dnsSocket,
+               Map<String, Connection> dnsMap) {
         this.clientChannel = clientChannel;
         this.selector = selector;
         this.connectionServerMap = connectionServerMap;
         this.listenPort = listenPort;
+        this.dnsChannel = dnsSocket;
+        this.dnsMap = dnsMap;
     }
 
     private void connectToServer(InetSocketAddress serverSocketAddress) throws IOException {
@@ -158,13 +169,16 @@ class Connection {
 
 
     void sendConnectionConfirmation() {
+        if (serverChannel.isConnected()) {
+            return;
+        }
         byte[] arr = {
                 0x05, // version
                 0x00, // status "connection established"
                 0x00, // reserved byte
                 0x01, // type of address
                 0x7F, 0x00, 0x00, 0x01, // 127.0.0.1 (not sure what does it do)
-                (byte)((listenPort >> 8) & 0xFF), (byte)(listenPort & 0xFF)  // port (not sure about this one as well)
+                (byte) ((listenPort >> 8) & 0xFF), (byte) (listenPort & 0xFF)  // port (not sure about this one as well)
         };
         fcBuffer.clear();
         fcBuffer.put(arr);
@@ -187,17 +201,42 @@ class Connection {
                 sb.append(unsignedByteToSignedInt(array[6]));
                 sb.append(".");
                 sb.append(unsignedByteToSignedInt(array[7]));
-                int port = ((array[8] & 0xff) << 8) | (array[9] & 0xff); // make one int of two bytes
-                InetSocketAddress address = new InetSocketAddress(sb.toString(), port);
+                serverPort = ((array[8] & 0xff) << 8) | (array[9] & 0xff); // make one int of two bytes
+                InetSocketAddress address = new InetSocketAddress(sb.toString(), serverPort);
                 connectToServer(address);
-            } else if (array[3] == 0x03){    // TODO: add support of dns resolving
+            } else if (array[3] == 0x03) {
+                // TODO: add support of dns resolving
                 System.out.println("DNS FOUND!!!");
-                return -1;
+
+                int length = array[4];
+                StringBuilder sb = new StringBuilder();
+                int i;
+                for (i = 5; i < 5 + length; ++i) {
+                    sb.append((char)array[i]);
+                }
+                sb.append('.'); // DNS message needs a trailing dot
+                serverPort = ((array[i] & 0xff) << 8) | (array[i+1] & 0xff); // make one int of two bytes
+                Message msg = Message.newQuery( // create Message with A record question
+                        ARecord.newRecord(
+                                Name.fromString(sb.toString()),
+                                Type.A,
+                                DClass.ANY)
+                );
+                byte[] msgBytes = msg.toWire();
+                DatagramPacket sPacket = new DatagramPacket(msgBytes,
+                        0,
+                        msgBytes.length
+                );
+                dnsMap.put(sb.toString(), this);
+                dnsChannel.write(ByteBuffer.wrap(sPacket.getData(),0,sPacket.getData().length));
             }
-
-
         }
         return 0;
+    }
+
+    void onDnsResolved(String address) throws IOException {
+        InetSocketAddress a = new InetSocketAddress(address, serverPort);
+        connectToServer(a);
     }
 
     private int readAndAuth() throws IOException {
@@ -220,7 +259,6 @@ class Connection {
                 responseArray[1] = (byte) 0xFF;
             } else {
                 responseArray[0] = 0x05;
-//                responseArray[1] = 0x00; // already assigned
             }
             fcBuffer.clear();
             fcBuffer.put(responseArray);
@@ -229,7 +267,7 @@ class Connection {
             //System.out.println("Sent readAndAuth data: " + (canAuth ? "can readAndAuth (" : "cannot readAndAuth (") + written + "/3)");
         }
         if (cfReadBytes == -1) {
-            serverChannel.close();
+            //serverChannel.close();
             cfBuffer.clear();
             return -1;
         } else {
@@ -258,7 +296,7 @@ class Connection {
         return true;
     }
 
-    // need this because byte is always signed in Java, but we need to convert in to unsigned int (e.g. -128 -> 255)
+    // need this because byte is always signed in Java but we need to convert in to unsigned int (e.g. -128 -> 255)
     private static int unsignedByteToSignedInt(byte b) {
         return (int) b & 0xFF;
     }
